@@ -1,0 +1,36 @@
+/**
+ * For more details on how to configure Wrangler, refer to:
+ * https://developers.cloudflare.com/workers/wrangler/configuration/
+ */
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "biopro-parser",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-03-10",
+  "observability": {
+    "enabled": true
+  },
+  "upload_source_maps": true,
+  "compatibility_flags": [
+    "nodejs_compat"
+  ],
+  /**
+   * Bindings
+   */
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "biopro-db",
+      "database_id": "e06b9571-f67e-4df0-bb9d-df07828a97b9"
+    }
+  ],
+  "vectorize": [
+    {
+      "binding": "VECTOR_INDEX",
+      "index_name": "biopro-docs" 
+    }
+  ],
+  "ai": {
+    "binding": "AI"
+  }
+}

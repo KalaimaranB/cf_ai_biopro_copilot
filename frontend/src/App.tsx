@@ -1,6 +1,6 @@
-import { useState, useEffect } from 'react';
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
 import { authClient } from './authClient';
+import KnowledgeBase from './pages/KnowledgeBase';
 import { THEME } from './theme';
 
 // Pages & Layouts
@@ -28,10 +28,13 @@ export default function App() {
         />
 
         {/* PROTECTED ROUTES: Wrapped in the AppLayout Header */}
-        <Route element={session ? <AppLayout /> : <Navigate to="/" replace />}>
+        <Route 
+          element={session ? <AppLayout /> : <Navigate to="/" replace />}
+        >
           <Route path="/dashboard" element={<Dashboard />} />
+          <Route path="/knowledge" element={<KnowledgeBase />} />
           
-          {/* THE FIX: Actually rendering the pages we built! */}
+          {/* Successfully wired up to your live SOLID components! */}
           <Route path="/project/:projectId" element={<ProjectDetails />} />
           <Route path="/experiment/:experimentId" element={<ActiveExperiment />} />
         </Route>
