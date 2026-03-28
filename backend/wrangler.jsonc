@@ -1,0 +1,43 @@
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "backend",
+    "main": "src/index.ts",
+    "compatibility_date": "2026-03-10",
+    "observability": {
+        "enabled": true
+    },
+    "upload_source_maps": true,
+    "compatibility_flags": [
+        "nodejs_compat"
+    ],
+    "ai": {
+        "binding": "AI"
+    },
+    "vectorize": [
+        {
+            "binding": "VECTOR_INDEX",
+            "index_name": "biopro-docs"
+        }
+    ],
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "biopro-db",
+            "database_id": "e06b9571-f67e-4df0-bb9d-df07828a97b9"
+        }
+    ],
+    "durable_objects": {
+        "bindings": [
+            {
+                "name": "LAB_SESSION",
+                "class_name": "LabSessionDO"
+            }
+        ]
+    },
+    "migrations": [
+        {
+            "tag": "v1",
+            "new_sqlite_classes": ["LabSessionDO"]
+        }
+    ]
+}
