@@ -35,7 +35,7 @@ export default function ChatSidebar({ messages, liveTranscript, isLoading, isLis
   }, [messages, liveTranscript, isLoading]);
 
   useEffect(() => {
-    let interval: NodeJS.Timeout;
+    let interval: ReturnType<typeof setTimeout>;
     if (isLoading) {
       interval = setInterval(() => {
         setDots(prev => (prev.length >= 3 ? '' : prev + '.'));
