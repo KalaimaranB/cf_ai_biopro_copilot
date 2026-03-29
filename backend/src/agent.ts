@@ -2,6 +2,12 @@ import { DurableObject } from "cloudflare:workers";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
+export interface Env {
+  AI: any; 
+  VECTOR_INDEX: VectorizeIndex;
+  DB: D1Database;
+}
+
 interface ChunkMeta {
   chunkId: string;
   sourceId: number;
@@ -12,7 +18,7 @@ interface ChunkMeta {
 
 interface FusionContext {
   chunks: ChunkMeta[];
-  sources: { id: number; title: string; url?: string }[];
+  sources: { id: number; title: string; url?: string; text?: string }[];
 }
 
 // ─── Durable Object ───────────────────────────────────────────────────────────
@@ -21,7 +27,7 @@ export class LabSessionDO extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
   }
-  // SSE helper: emits a typed event over the stream
+
   private makeEmitter(writer: WritableStreamDefaultWriter<Uint8Array>) {
     const encoder = new TextEncoder();
     return async (type: string, data: unknown) => {
@@ -42,16 +48,12 @@ export class LabSessionDO extends DurableObject<Env> {
     }
 
     const { userMessage } = await request.json() as { userMessage: string };
-
-    // Load conversation history from DO storage
-    const history: { role: string; content: string }[] =
-      (await this.ctx.storage.get("chat_history")) || [];
+    const history: { role: string; content: string }[] = (await this.ctx.storage.get("chat_history")) || [];
 
     const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const writer = writable.getWriter();
     const emit = this.makeEmitter(writer);
 
-    // Run the pipeline in the background so we can return the stream immediately
     this.ctx.waitUntil(this.runPipeline(userMessage, history, emit, writer));
 
     return new Response(readable, {
@@ -72,41 +74,70 @@ export class LabSessionDO extends DurableObject<Env> {
     writer: WritableStreamDefaultWriter<Uint8Array>
   ) {
     try {
-      // ── Step 1: Parallel Retrieval ──────────────────────────────────────────
-      await emit("thought", "🔍 Launching parallel retrieval across all knowledge sources...");
+      // ── Step 1: Intent & Refinement ─────────────────────────────────────────
+      await emit("thought", "🔧 Analyzing acoustic intent and optimizing search parameters...");
+      
+      const refinementPrompt = `Analyze this user query: "${userMessage}"
+      1. Classify intent as "FOUNDATIONAL" (general biology/overview/how things work) or "SPECIFIC" (niche data/mechanisms).
+      2. Generate 3-5 highly specific, correctly spelled search keywords. Fix typos.
+      Output ONLY valid JSON in this exact format: {"intent": "FOUNDATIONAL", "keywords": "heart pumping mechanism cardiac"}`;
 
+      const refinedRes = await (this.env as any).AI.run("@cf/meta/llama-3-8b-instruct", {
+        messages: [{ role: "user", content: refinementPrompt }],
+        max_tokens: 60
+      });
+      
+      let searchParams = { intent: "SPECIFIC", keywords: userMessage };
+      try {
+        searchParams = JSON.parse(refinedRes.response?.match(/\{[\s\S]*\}/)?.[0] || "{}");
+      } catch (e) { /* fallback */ }
+
+      await emit("thought", `🔍 Parallel retrieval for: [${searchParams.keywords}] (Mode: ${searchParams.intent})...`);
+
+      // ── Step 2: Parallel Retrieval ──────────────────────────────────────────
       const [internalResult, pubmedResult] = await Promise.allSettled([
-        this.searchInternal(userMessage, emit),
-        this.searchPubMed(userMessage, emit),
+        this.searchInternal(searchParams.keywords, emit), 
+        this.searchPubMed(searchParams.keywords, searchParams.intent, emit)
       ]);
 
-      // ── Step 2: Fuse Context ────────────────────────────────────────────────
-      const fusedContext = this.fuseContext(internalResult, pubmedResult);
+      // ── Step 3: Fuse & Judge ────────────────────────────────────────────────
+      const rawFusedContext = this.fuseContext(internalResult, pubmedResult);
+      const verifiedChunks = await this.judgeAndFilterChunks(userMessage, rawFusedContext.chunks, emit);
+      
+      if (verifiedChunks.length === 0) {
+        await emit("thought", "❌ No verified literature found. Short-circuiting to prevent hallucinations.");
+        const fallbackMsg = "I couldn't find any verified literature on this topic in your internal database or PubMed. Could you clarify or broaden your search terms?";
+        
+        const words = fallbackMsg.split(" ");
+        for (const word of words) await emit("text_delta", word + " ");
+
+        history.push({ role: "user", content: userMessage });
+        history.push({ role: "assistant", content: fallbackMsg });
+        await this.ctx.storage.put("chat_history", history.slice(-20));
+        await emit("done", { sources: [] });
+        return;
+      }
+
+      const fusedContext = {
+        chunks: verifiedChunks,
+        sources: rawFusedContext.sources.filter(s => verifiedChunks.some(c => c.sourceId === s.id))
+      };
 
       await emit("thought", `✅ Context loaded: ${fusedContext.chunks.length} chunks from ${fusedContext.sources.length} source(s).`);
-
-      // Send source metadata immediately so the frontend can pre-build the bibliography
       await emit("context_loaded", { sources: fusedContext.sources });
 
-      // ── Step 3: Build tagged context block ─────────────────────────────────
-      const contextBlock = fusedContext.chunks
-        .map(c => `[${c.chunkId}]\n${c.text}`)
-        .join("\n\n---\n\n");
+      const contextBlock = fusedContext.chunks.map(c => `[${c.chunkId}]\n${c.text}`).join("\n\n---\n\n");
 
-      // ── Step 4: Synthesize with strict citation rules ───────────────────────
+      // ── Step 4: Synthesize ──────────────────────────────────────────────────
       await emit("thought", "🧠 Synthesizing response with sentence-level citations...");
 
       const systemPrompt = this.buildSystemPrompt(contextBlock, fusedContext.chunks);
-
       history.push({ role: "user", content: userMessage });
 
       const aiResponse = await (this.env as any).AI.run(
         "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
         {
-          messages: [
-            { role: "system", content: systemPrompt },
-            ...history,
-          ],
+          messages: [ { role: "system", content: systemPrompt }, ...history ],
           max_tokens: 2048,
           stream: false,
         }
@@ -114,27 +145,16 @@ export class LabSessionDO extends DurableObject<Env> {
 
       const rawText: string = aiResponse.response?.trim() || "No response generated.";
 
-      // ── Step 5: Parse chunk IDs → numbered citations ────────────────────────
-      const { renderedText, citationMap } = this.parseCitations(rawText, fusedContext.chunks);
+      // ── Step 5: Citation Parsing (FIXED MAPPING) ────────────────────────────
+      const { renderedText, finalSources } = this.parseCitations(rawText, fusedContext.chunks, fusedContext.sources);
 
-      // ── Step 6: Stream the rendered text word-by-word ──────────────────────
       const words = renderedText.split(" ");
-      for (const word of words) {
-        await emit("text_delta", word + " ");
-      }
+      for (const word of words) await emit("text_delta", word + " ");
 
-      // ── Step 7: Persist history & send final metadata ───────────────────────
       history.push({ role: "assistant", content: renderedText });
-      await this.ctx.storage.put("chat_history", history.slice(-20)); // keep last 20 turns
+      await this.ctx.storage.put("chat_history", history.slice(-20)); 
 
-      const usedSources = fusedContext.sources.filter(s =>
-        citationMap.some(c => c.sourceId === s.id)
-      );
-
-      await emit("done", {
-        sources: usedSources,
-        citationMap,
-      });
+      await emit("done", { sources: finalSources });
 
     } catch (err: any) {
       console.error("Pipeline crash:", err);
@@ -144,37 +164,51 @@ export class LabSessionDO extends DurableObject<Env> {
     }
   }
 
-  // ─── Internal Vector Search ─────────────────────────────────────────────────
+  // ─── Semantic Re-Ranker (Balanced Judge) ──────────────────────────────────
+  private async judgeAndFilterChunks(query: string, chunks: ChunkMeta[], emit: (type: string, data: unknown) => Promise<void>): Promise<ChunkMeta[]> {
+    if (chunks.length === 0) return [];
+    await emit("thought", "⚖️ Running semantic judge to verify literature relevance...");
 
-  private async searchInternal(
-    query: string,
-    emit: (type: string, data: unknown) => Promise<void>
-  ): Promise<ChunkMeta[]> {
+    const prompt = `You are a relevance judge for a biomedical AI.
+    User Query: "${query}"
+    
+    Evaluate these text chunks. Return a JSON array containing the numeric IDs of chunks that are RELEVANT to answering the query. 
+    A chunk is relevant if it provides background physiology, mechanisms, or direct data related to the topic. 
+    ONLY exclude a chunk if it is completely off-topic (e.g., about a totally different organ or disease).
+    If NO chunks are relevant, output an empty array: []
+    
+    ${chunks.map((c, i) => `[ID: ${i}] ${c.text.substring(0, 400)}...`).join('\n\n')}
+    
+    Output strictly a valid JSON array of integers, e.g., [0, 2].`;
+    
+    try {
+        const res = await (this.env as any).AI.run("@cf/meta/llama-3-8b-instruct", { messages: [{role: "user", content: prompt}], max_tokens: 30 });
+        const match = res.response?.match(/\[([\d,\s]*)\]/);
+        if (match) {
+            const validIds = JSON.parse(match[0]) as number[];
+            const survivors = chunks.filter((_, i) => validIds.includes(i));
+            await emit("thought", `🧹 Judge removed ${chunks.length - survivors.length} off-topic chunk(s).`);
+            return survivors;
+        }
+    } catch (e) {
+        console.error("Judge failed", e);
+    }
+    
+    // Failsafe: If the 8B model API hiccups, trust the vector search and let the chunks through
+    return chunks; 
+  }
+
+  // ─── Internal Vector Search ─────────────────────────────────────────────────
+  private async searchInternal(query: string, emit: (type: string, data: unknown) => Promise<void>): Promise<ChunkMeta[]> {
     await emit("thought", "📚 Searching internal knowledge base...");
 
-    const embedding = await (this.env as any).AI.run("@cf/baai/bge-large-en-v1.5", {
-      text: [query],
-    });
+    const embedding = await (this.env as any).AI.run("@cf/baai/bge-large-en-v1.5", { text: [query] });
+    const results = await (this.env as any).VECTOR_INDEX.query(embedding.data[0], { topK: 4, returnMetadata: "all" });
 
-    const results = await (this.env as any).VECTOR_INDEX.query(
-      embedding.data[0],
-      { topK: 4, returnMetadata: "all" }
-    );
+    if (!results.matches || results.matches.length === 0) return [];
 
-    if (!results.matches || results.matches.length === 0) {
-      await emit("thought", "📚 Internal: no relevant chunks found.");
-      return [];
-    }
-
-    // Score threshold — only keep high-confidence matches
-    const relevant = results.matches.filter((m: any) => m.score > 0.65);
-
-    if (relevant.length === 0) {
-      await emit("thought", "📚 Internal: chunks found but below relevance threshold.");
-      return [];
-    }
-
-    await emit("thought", `📚 Internal: found ${relevant.length} relevant chunk(s).`);
+    const relevant = results.matches.filter((m: any) => m.score > 0.60);
+    if (relevant.length === 0) return [];
 
     const chunks: ChunkMeta[] = [];
     let sourceId = 1;
@@ -182,155 +216,113 @@ export class LabSessionDO extends DurableObject<Env> {
     for (const match of relevant) {
       const docId = match.metadata?.document_id;
       let title = "Internal Document";
-
       if (docId) {
-        const row = await (this.env as any).DB
-          .prepare("SELECT filename FROM project_documents WHERE id = ?")
-          .bind(docId)
-          .first();
+        const row = await (this.env as any).DB.prepare("SELECT filename FROM project_documents WHERE id = ?").bind(docId).first();
         if (row?.filename) title = row.filename as string;
       }
-
-      const chunkIdx = chunks.length;
-      chunks.push({
-        chunkId: `int_${chunkIdx}`,
-        sourceId,
-        title,
-        text: match.metadata?.text || "",
-      });
+      chunks.push({ chunkId: `int_${chunks.length}`, sourceId, title, text: match.metadata?.text || "" });
       sourceId++;
     }
-
     return chunks;
   }
 
   // ─── PubMed Search ──────────────────────────────────────────────────────────
-
-  private async searchPubMed(
-    query: string,
-    emit: (type: string, data: unknown) => Promise<void>
-  ): Promise<ChunkMeta[]> {
+  private async searchPubMed(query: string, intent: string, emit: (type: string, data: unknown) => Promise<void>): Promise<ChunkMeta[]> {
     await emit("thought", "🔬 Querying PubMed for external literature...");
-
     try {
-      const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(query)}&retmode=json&retmax=3&sort=relevance`;
+      const finalQuery = intent === "FOUNDATIONAL" ? `${query} AND Review[pt]` : query;
+      const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(finalQuery)}&retmode=json&retmax=3&sort=relevance`;
       const searchRes = await fetch(searchUrl);
       const searchData = await searchRes.json() as any;
       const ids: string[] = searchData.esearchresult?.idlist || [];
 
-      if (ids.length === 0) {
-        await emit("thought", "🔬 PubMed: no articles found.");
-        return [];
-      }
+      if (ids.length === 0) return [];
 
       await emit("thought", `🔬 PubMed: found ${ids.length} article(s). Fetching abstracts...`);
-
       const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id=${ids.join(",")}&rettype=abstract&retmode=text`;
       const text = await fetch(fetchUrl).then(r => r.text());
-
-      // Split into per-article chunks (rough split on double newline + PMID pattern)
       const articleBlocks = text.split(/\n\n(?=\d+\.)/).slice(0, 3);
 
-      const chunks: ChunkMeta[] = articleBlocks.map((block, i) => ({
+      return articleBlocks.map((block, i) => ({
         chunkId: `pub_${i}`,
-        sourceId: 100 + i, // offset so they don't collide with internal IDs
+        sourceId: 100 + i, 
         title: `PubMed: ${query} (${ids[i] || "abstract"})`,
         url: `https://pubmed.ncbi.nlm.nih.gov/${ids[i]}/`,
         text: block.trim(),
       }));
-
-      await emit("thought", `🔬 PubMed: ${chunks.length} abstract chunk(s) loaded.`);
-      return chunks;
-
-    } catch (err) {
-      await emit("thought", "🔬 PubMed: request failed.");
-      return [];
-    }
+    } catch (err) { return []; }
   }
 
   // ─── Context Fusion ─────────────────────────────────────────────────────────
-
-  private fuseContext(
-    internalResult: PromiseSettledResult<ChunkMeta[]>,
-    pubmedResult: PromiseSettledResult<ChunkMeta[]>
-  ): FusionContext {
+  private fuseContext(internalResult: PromiseSettledResult<ChunkMeta[]>, pubmedResult: PromiseSettledResult<ChunkMeta[]>): FusionContext {
     const internal = internalResult.status === "fulfilled" ? internalResult.value : [];
     const pubmed = pubmedResult.status === "fulfilled" ? pubmedResult.value : [];
-
     const allChunks = [...internal, ...pubmed];
 
-    // Re-number sourceIds sequentially after fusion
     let counter = 1;
     const idMap = new Map<number, number>();
 
     for (const chunk of allChunks) {
-      if (!idMap.has(chunk.sourceId)) {
-        idMap.set(chunk.sourceId, counter++);
-      }
+      if (!idMap.has(chunk.sourceId)) idMap.set(chunk.sourceId, counter++);
       chunk.sourceId = idMap.get(chunk.sourceId)!;
     }
 
     const sources = allChunks
       .filter((c, i, arr) => arr.findIndex(x => x.sourceId === c.sourceId) === i)
-      .map(c => ({ id: c.sourceId, title: c.title, url: c.url }));
+      .map(c => ({ id: c.sourceId, title: c.title, url: c.url, text: c.text }));
 
     return { chunks: allChunks, sources };
   }
 
   // ─── System Prompt ──────────────────────────────────────────────────────────
-
   private buildSystemPrompt(contextBlock: string, chunks: ChunkMeta[]): string {
-    const chunkIndex = chunks
-      .map(c => `${c.chunkId} → Source [${c.sourceId}]: ${c.title}`)
-      .join("\n");
+    const chunkIndex = chunks.map(c => `${c.chunkId} → Source [${c.sourceId}]: ${c.title}`).join("\n");
 
     return `You are BioPro Copilot, an expert biomedical research assistant.
 
-You have been given a fused context block from two sources: internal lab documents and PubMed literature.
-
 CONTEXT BLOCK:
-${contextBlock || "(No relevant context found — answer from general knowledge.)"}
+${contextBlock}
 
 CHUNK → SOURCE MAP:
-${chunkIndex || "(none)"}
+${chunkIndex}
 
 CITATION RULES (STRICT):
-1. After EVERY sentence that uses information from the context, append the chunk ID in square brackets, e.g.: "Actin regulates T-cell motility [int_0]."
-2. Use the EXACT chunk ID from the CHUNK → SOURCE MAP above.
-3. If a sentence uses multiple chunks, list all: "... [int_0][pub_1]."
-4. If a sentence comes from your general knowledge (not the context), do NOT append any tag.
-5. NEVER invent chunk IDs. Only use IDs listed above.
-6. NEVER generate URLs yourself.
-7. Write in clear, confident scientific prose. Use markdown headers and bullet points where helpful.`;
+1. After EVERY sentence that uses context, append the chunk ID in square brackets: e.g., "Actin regulates motility [int_0]."
+2. Use EXACT chunk IDs.
+3. NEVER write a "References" or "Sources" section at the end of your response.
+4. Write in clear scientific prose using headers and bullets.`;
   }
 
-  // ─── Citation Parser ─────────────────────────────────────────────────────────
-
+  // ─── Citation Parser (THE FIX) ──────────────────────────────────────────────
   private parseCitations(
     rawText: string,
-    chunks: ChunkMeta[]
-  ): { renderedText: string; citationMap: { chunkId: string; sourceId: number }[] } {
+    chunks: ChunkMeta[],
+    originalSources: { id: number; title: string; url?: string; text?: string }[]
+  ): { renderedText: string; finalSources: any[] } {
     const chunkToSource = new Map(chunks.map(c => [c.chunkId, c.sourceId]));
-    const citationMap: { chunkId: string; sourceId: number }[] = [];
-
-    // Track which sourceIds have been assigned a display number
     const sourceDisplayNum = new Map<number, number>();
     let displayCounter = 1;
 
-    // Replace [chunk_id] with [N] superscript notation
-    const renderedText = rawText.replace(/\[(\w+_\d+)\]/g, (_, chunkId) => {
-      const sourceId = chunkToSource.get(chunkId);
-      if (sourceId === undefined) return ""; // unknown chunk id — strip it
+    // Use case-insensitive regex in case LLM writes [INT_0]
+    const renderedText = rawText.replace(/\[(int_\d+|pub_\d+)\]/gi, (_, chunkId) => {
+      const sourceId = chunkToSource.get(chunkId.toLowerCase());
+      if (sourceId === undefined) return ""; 
 
       if (!sourceDisplayNum.has(sourceId)) {
         sourceDisplayNum.set(sourceId, displayCounter++);
-        citationMap.push({ chunkId, sourceId });
       }
-
-      const num = sourceDisplayNum.get(sourceId)!;
-      return `[${num}]`;
+      return `[${sourceDisplayNum.get(sourceId)}]`;
     });
 
-    return { renderedText, citationMap };
+    // Remap the source array IDs to match the newly generated display numbers
+    const finalSources = originalSources
+      .filter(s => sourceDisplayNum.has(s.id))
+      .map(s => ({
+        ...s,
+        id: sourceDisplayNum.get(s.id)! // The magic link
+      }))
+      .sort((a, b) => a.id - b.id);
+
+    return { renderedText, finalSources };
   }
 }

@@ -96,6 +96,25 @@ export default {
     ) {
       return handleProjectRoutes(request, url, env, corsHeaders, userId);
     }
+    if (url.pathname === "/api/status" && request.method === "GET") {
+      const expId = url.searchParams.get("experimentId");
+      if (!expId) return new Response("Missing ID", { status: 400, headers: corsHeaders });
+      
+      const row = await env.DB.prepare("SELECT status FROM experiments WHERE id = ?").bind(expId).first();
+      return new Response(JSON.stringify({ status: row?.status || 'In Progress' }), { headers: corsHeaders });
+    }
+
+    if (url.pathname === "/api/status" && request.method === "POST") {
+      const { experimentId, status } = await request.json() as any;
+      if (!experimentId || !status) return new Response("Missing data", { status: 400, headers: corsHeaders });
+
+      // Safely update the existing row
+      await env.DB.prepare(
+        "UPDATE experiments SET status = ? WHERE id = ?"
+      ).bind(status, experimentId).run();
+      
+      return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
+    }
     
     if (url.pathname === "/api/transcribe" && request.method === "POST") {
       return handleTranscribeRoute(request, env, corsHeaders);
