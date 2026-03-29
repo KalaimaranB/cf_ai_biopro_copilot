@@ -12,8 +12,8 @@ export default function LoginScreen() {
     try {
       // This automatically redirects the user to Google, then back to your app!
       await authClient.signIn.social({
-        provider: "google",
-        callbackURL: "http://localhost:5173" 
+          provider: "google",
+          callbackURL: window.location.origin, // This ensures it stays on the domain you're currently visiting
       });
     } catch (err: any) {
       setError("Failed to initialize Google Secure Session.");

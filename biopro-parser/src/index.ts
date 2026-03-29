@@ -5,17 +5,30 @@ export interface Env {
   AI: any;
 }
 
-const corsHeaders = {
-  'Access-Control-Allow-Origin': 'http://localhost:5173', // Update this to your production URL later
-  'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
-  'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-  'Access-Control-Allow-Credentials': 'true'
-};
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
+    
+    // 1. Read where the request is coming from
+    const origin = request.headers.get("Origin") || "";
+    
+    // 2. Only allow localhost or your specific Pages domain
+    // REPLACE the pages URL below with your actual deployed .pages.dev link!
+    const allowedOrigin = origin.includes("localhost") || origin.includes(".pages.dev") 
+      ? origin 
+      : "https://cf-ai-biopro-copilot.pages.dev"; 
+
+    // 3. Generate the strict CORS headers dynamically
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': allowedOrigin,
+      'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
+      'Access-Control-Allow-Credentials': 'true' // This is the magic line that allows Google Auth
+    };
+
     // Handle CORS preflight
-    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
     
     const url = new URL(request.url);
 

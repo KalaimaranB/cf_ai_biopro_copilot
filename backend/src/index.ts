@@ -15,29 +15,45 @@ export interface Env {
   GOOGLE_CLIENT_SECRET: string;
 }
 
-const TRUSTED_ORIGINS = [
-  "http://localhost:5173",
-  "https://frontend.biopro.workers.dev",
-  "https://biopro-app.pages.dev",
-];
-
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
-    const origin = request.headers.get("Origin") || "http://localhost:5173";
+    const origin = request.headers.get("Origin") || "";
+    
+    // 1. Dynamic Origin Logic
+    // 2. Allow Localhost, Pages, OR your specific Workers frontend domain
+    const isAllowed = 
+      origin.includes("localhost") || 
+      origin.includes(".pages.dev") || 
+      origin.includes("biopro.workers.dev"); // <-- ADDED THIS
 
-    const corsHeaders: Record<string, string> = {
-      "Access-Control-Allow-Origin": TRUSTED_ORIGINS.includes(origin)
-        ? origin
-        : TRUSTED_ORIGINS[0],
-      "Access-Control-Allow-Methods": "GET, POST, PUT, DELETE, OPTIONS",
-      "Access-Control-Allow-Headers": "Content-Type, Authorization",
-      "Access-Control-Allow-Credentials": "true",
+    const allowedOrigin = isAllowed ? origin : "https://cf-ai-biopro-copilot.pages.dev"; 
+
+    const corsHeaders = {
+      'Access-Control-Allow-Origin': allowedOrigin,
+      'Access-Control-Allow-Methods': 'GET, POST, PUT, DELETE, OPTIONS',
+      'Access-Control-Allow-Headers': 'Content-Type, Authorization, X-Requested-With',
+      'Access-Control-Allow-Credentials': 'true',
     };
 
+    // 2. Handle Preflight immediately
     if (request.method === "OPTIONS") {
       return new Response(null, { headers: corsHeaders });
     }
 
+    // 3. Helper to wrap ANY response with our CORS headers
+    const wrapResponse = (res: Response) => {
+      const newHeaders = new Headers(res.headers);
+      Object.entries(corsHeaders).forEach(([key, value]) => {
+        newHeaders.set(key, value);
+      });
+      return new Response(res.body, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: newHeaders,
+      });
+    };
+
+    // 4. Initialize Auth
     const auth = betterAuth({
       database: { dialect: new D1Dialect({ database: env.DB }), type: "sqlite" },
       socialProviders: {
@@ -46,114 +62,80 @@ export default {
           clientSecret: env.GOOGLE_CLIENT_SECRET,
         },
       },
-      trustedOrigins: TRUSTED_ORIGINS,
+      // 1. HARD-CODE these for now to be 100% sure
+      trustedOrigins: [
+        "https://cf-ai-biopro-copilot.biopro.workers.dev",
+        "https://cf-ai-biopro-copilot.pages.dev",
+        "http://localhost:5173"
+      ],
       baseURL: "https://backend.biopro.workers.dev",
       secret: env.AUTH_SECRET,
-      advanced: { defaultCookieAttributes: { sameSite: "none", secure: true } },
+      
+      // 2. THIS IS THE KEY: Tell the library we are cross-origin
+      advanced: { 
+        crossOrigin: true, // <--- ADD THIS
+        defaultCookieAttributes: { 
+          sameSite: "none", 
+          secure: true 
+        } 
+      },
     });
 
     const url = new URL(request.url);
 
-    // ── Auth ──────────────────────────────────────────────────────────────────
-    if (url.pathname.startsWith("/api/auth")) {
-      try {
-        const authResponse = await auth.handler(request);
-        const headers = new Headers(authResponse.headers);
-        headers.set("Access-Control-Allow-Origin", corsHeaders["Access-Control-Allow-Origin"]);
-        headers.set("Access-Control-Allow-Credentials", "true");
-        return new Response(authResponse.body, {
-          status: authResponse.status,
-          headers,
-        });
-      } catch (e: any) {
-        return new Response(`Auth error: ${e.message}`, {
-          status: 500,
-          headers: corsHeaders,
-        });
+    try {
+      // ── Auth Routes ──────
+      if (url.pathname.startsWith("/api/auth")) {
+        const authRes = await auth.handler(request);
+        return wrapResponse(authRes);
       }
-    }
 
-    // ── Session gate for all /api/ and root POST ──────────────────────────────
-    let userId = "";
-    if (url.pathname.startsWith("/api/") || url.pathname === "/") {
+      // ── Session Gate ──────
       const session = await auth.api.getSession({ headers: request.headers });
-      if (!session?.user) {
-        return new Response("Unauthorized", { status: 401, headers: corsHeaders });
+      if (!session?.user && (url.pathname.startsWith("/api/") || url.pathname === "/")) {
+        // Exempt public status check if needed, otherwise:
+        return wrapResponse(new Response("Unauthorized", { status: 401 }));
       }
-      userId = session.user.id;
-    }
+      const userId = session?.user?.id || "";
 
-    // ── Knowledge base ────────────────────────────────────────────────────────
-    if (url.pathname.startsWith("/api/knowledge")) {
-      return handleKnowledgeRoutes(request, url, env, corsHeaders);
-    }
+      // ── Route Handlers ──────
+      let response: Response;
 
-    // ── Projects / Experiments / Logs ─────────────────────────────────────────
-    if (
-      url.pathname.startsWith("/api/projects") ||
-      url.pathname.startsWith("/api/experiments") ||
-      url.pathname.startsWith("/api/logs")
-    ) {
-      return handleProjectRoutes(request, url, env, corsHeaders, userId);
-    }
-    if (url.pathname === "/api/status" && request.method === "GET") {
-      const expId = url.searchParams.get("experimentId");
-      if (!expId) return new Response("Missing ID", { status: 400, headers: corsHeaders });
-      
-      const row = await env.DB.prepare("SELECT status FROM experiments WHERE id = ?").bind(expId).first();
-      return new Response(JSON.stringify({ status: row?.status || 'In Progress' }), { headers: corsHeaders });
-    }
-
-    if (url.pathname === "/api/status" && request.method === "POST") {
-      const { experimentId, status } = await request.json() as any;
-      if (!experimentId || !status) return new Response("Missing data", { status: 400, headers: corsHeaders });
-
-      // Safely update the existing row
-      await env.DB.prepare(
-        "UPDATE experiments SET status = ? WHERE id = ?"
-      ).bind(status, experimentId).run();
-      
-      return new Response(JSON.stringify({ success: true }), { headers: corsHeaders });
-    }
-    
-    if (url.pathname === "/api/transcribe" && request.method === "POST") {
-      return handleTranscribeRoute(request, env, corsHeaders);
-    }
-
-    // ── Agentic Copilot (SSE stream) ──────────────────────────────────────────
-    if (request.method === "POST" && url.pathname === "/") {
-      try {
-        // Each user gets their own persistent DO instance (chat history lives here)
+      if (url.pathname.startsWith("/api/knowledge")) {
+        response = await handleKnowledgeRoutes(request, url, env, corsHeaders);
+      } else if (url.pathname.startsWith("/api/projects") || url.pathname.startsWith("/api/logs")) {
+        response = await handleProjectRoutes(request, url, env, corsHeaders, userId);
+      } else if (url.pathname === "/api/status") {
+        if (request.method === "GET") {
+          const expId = url.searchParams.get("experimentId");
+          const row = await env.DB.prepare("SELECT status FROM experiments WHERE id = ?").bind(expId).first();
+          response = new Response(JSON.stringify({ status: row?.status || 'In Progress' }));
+        } else {
+          const { experimentId, status } = await request.json() as any;
+          await env.DB.prepare("UPDATE experiments SET status = ? WHERE id = ?").bind(status, experimentId).run();
+          response = new Response(JSON.stringify({ success: true }));
+        }
+      } else if (url.pathname === "/api/transcribe") {
+        response = await handleTranscribeRoute(request, env, corsHeaders);
+      } else if (request.method === "POST" && url.pathname === "/") {
+        // SSE Special Case
         const doId = env.LAB_SESSION.idFromName(userId);
         const doStub = env.LAB_SESSION.get(doId);
-
-        // Forward the request as-is to the DO
-        const doResponse = await doStub.fetch(request);
-
-        // Pipe the SSE stream back, injecting CORS headers
-        const headers = new Headers({
-          "Content-Type": "text/event-stream",
-          "Cache-Control": "no-cache",
-          "Connection": "keep-alive",
-          ...corsHeaders,
-        });
-
-        return new Response(doResponse.body, {
-          status: doResponse.status,
-          headers,
-        });
-      } catch (err: any) {
-        console.error("DO fetch error:", err);
-        return new Response(
-          `data: ${JSON.stringify({ type: "error", data: { message: "Copilot unavailable." } })}\n\n`,
-          {
-            status: 500,
-            headers: { "Content-Type": "text/event-stream", ...corsHeaders },
-          }
-        );
+        const doRes = await doStub.fetch(request);
+        
+        // We wrap SSE manually to keep the stream alive
+        const sseHeaders = new Headers(doRes.headers);
+        Object.entries(corsHeaders).forEach(([k, v]) => sseHeaders.set(k, v));
+        return new Response(doRes.body, { headers: sseHeaders });
+      } else {
+        response = new Response("BioPro Backend Active", { status: 200 });
       }
-    }
 
-    return new Response("BioPro Backend Active", { status: 200, headers: corsHeaders });
+      return wrapResponse(response);
+
+    } catch (err) {
+      console.error("Worker Error:", err);
+      return wrapResponse(new Response("Internal Server Error", { status: 500 }));
+    }
   },
 };
