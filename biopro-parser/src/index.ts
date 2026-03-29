@@ -1,16 +1,3 @@
-/**
- * Welcome to Cloudflare Workers! This is your first worker.
- *
- * - Run `npm run dev` in your terminal to start a development server
- * - Open a browser tab at http://localhost:8787/ to see your worker in action
- * - Run `npm run deploy` to publish your worker
- *
- * Bind resources to your worker in `wrangler.jsonc`. After adding bindings, a type definition for the
- * `Env` object can be regenerated with `npm run cf-typegen`.
- *
- * Learn more at https://developers.cloudflare.com/workers/
- */
-
 export interface Env {
   LLAMAPARSE_API_KEY: string;
   DB: D1Database;
@@ -19,7 +6,7 @@ export interface Env {
 }
 
 const corsHeaders = {
-  'Access-Control-Allow-Origin': 'http://localhost:5173', // In production, add your deployed frontend URL
+  'Access-Control-Allow-Origin': 'http://localhost:5173', // Update this to your production URL later
   'Access-Control-Allow-Methods': 'POST, GET, OPTIONS',
   'Access-Control-Allow-Headers': 'Content-Type, Authorization',
   'Access-Control-Allow-Credentials': 'true'
@@ -48,7 +35,6 @@ export default {
         // 1. Forward to LlamaParse securely
         const lpFormData = new FormData();
         lpFormData.append('file', file);
-        // Optional: you can add premium flags here if you want vision features
         
         const lpRes = await fetch('https://api.cloud.llamaindex.ai/api/parsing/upload', {
           method: 'POST',
@@ -87,7 +73,6 @@ export default {
         });
         const statusData = await statusRes.json() as { status: string };
 
-        // If it's still PENDING or IN_PROGRESS, tell the frontend to keep waiting
         if (statusData.status !== "SUCCESS") {
           return new Response(JSON.stringify({ status: statusData.status }), { headers: corsHeaders });
         }
@@ -99,9 +84,7 @@ export default {
         const mdData = await mdRes.json() as { markdown: string };
         const markdown = mdData.markdown;
 
-        // 3. TRUE CREDIT TRACKING
-        // LlamaParse charges 4 credits per page for Vision/Multimodal extraction.
-        // We look for the job metadata, or fallback to our math with the 4x Vision multiplier.
+        // 3. TRUE CREDIT TRACKING (LlamaParse Vision multiplier)
         const actualCreditsUsed = (statusData as any).job_metadata?.credits_used 
                                   || (Math.max(1, Math.ceil(markdown.length / 2500)) * 4);
 
@@ -124,7 +107,7 @@ export default {
         const { data: embeddings } = await env.AI.run('@cf/baai/bge-large-en-v1.5', { text: chunks });
         
         const vectorInserts = embeddings.map((embedding: number[], index: number) => ({
-          id: `${docId}-chunk-${index}`, // Predictable IDs so we can delete them later
+          id: `${docId}-chunk-${index}`, 
           values: embedding,
           metadata: { document_id: docId, text: chunks[index] }
         }));
@@ -137,3 +120,11 @@ export default {
         ).bind(actualCreditsUsed, chunks.length, docId).run();
 
         return new Response(JSON.stringify({ status: "SUCCESS", pagesUsed: actualCreditsUsed }), { headers: corsHeaders });
+      } catch (err: any) {
+        return new Response(JSON.stringify({ error: err.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    return new Response("Not Found", { status: 404, headers: corsHeaders });
+  }
+};

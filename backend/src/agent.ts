@@ -1,159 +1,336 @@
 import { DurableObject } from "cloudflare:workers";
 
-export class LabSessionDO extends DurableObject {
-  async fetch(request: Request) {
+// ─── Types ────────────────────────────────────────────────────────────────────
+
+interface ChunkMeta {
+  chunkId: string;
+  sourceId: number;
+  title: string;
+  url?: string;
+  text: string;
+}
+
+interface FusionContext {
+  chunks: ChunkMeta[];
+  sources: { id: number; title: string; url?: string }[];
+}
+
+// ─── Durable Object ───────────────────────────────────────────────────────────
+
+export class LabSessionDO extends DurableObject<Env> {
+  constructor(ctx: DurableObjectState, env: Env) {
+    super(ctx, env);
+  }
+  // SSE helper: emits a typed event over the stream
+  private makeEmitter(writer: WritableStreamDefaultWriter<Uint8Array>) {
+    const encoder = new TextEncoder();
+    return async (type: string, data: unknown) => {
+      const payload = `data: ${JSON.stringify({ type, data })}\n\n`;
+      await writer.write(encoder.encode(payload));
+    };
+  }
+
+  async fetch(request: Request): Promise<Response> {
     if (request.method === "OPTIONS") {
-      return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "POST, OPTIONS", "Access-Control-Allow-Headers": "*" }});
+      return new Response(null, {
+        headers: {
+          "Access-Control-Allow-Origin": "*",
+          "Access-Control-Allow-Methods": "POST, OPTIONS",
+          "Access-Control-Allow-Headers": "*",
+        },
+      });
     }
 
-    const { userMessage, mode } = await request.json() as { userMessage: string, mode: string };
-    let history: { role: string, content: string }[] = await this.ctx.storage.get("chat_history") || [];
-    
-    // 1. THE ANTI-BIAS SYSTEM PROMPT
-    const systemPrompt = `You are the BioPro Autonomous Research Agent. 
+    const { userMessage } = await request.json() as { userMessage: string };
 
-CRITICAL - STRICT TOOL ROUTING:
-1. GENERAL SCIENCE: If the user asks a general biological or medical question (e.g., "how does the heart pump", "what is a macrophage"), you MUST use "search_pubmed". DO NOT search internal SOPs.
-2. INTERNAL DATA: ONLY use "search_internal_sops" if the user explicitly references "my documents", "my protocol", "the uploaded paper", or specific internal lab data.
+    // Load conversation history from DO storage
+    const history: { role: string; content: string }[] =
+      (await this.ctx.storage.get("chat_history")) || [];
 
-HOW TO USE A TOOL (XML FORMAT):
-<use_tool>
-<name>search_pubmed</name>
-<query>your query here</query>
-</use_tool>
-
-ANTI-HALLUCINATION & CITATION RULES:
-1. NEVER FORCE A CONNECTION. If a tool returns <context> about T-Cells, and the user is asking about the Heart, the context is useless. IGNORE IT entirely and answer from general knowledge.
-2. If you use facts from the <context>, you MUST cite them inline using the provided [Source X] tags.
-3. If you ignore the <context> because it is irrelevant, DO NOT use any [Source X] tags.
-4. YOU ARE FORBIDDEN FROM GENERATING URLs.`;
-
-    history.push({ role: "user", content: userMessage });
-    let messagesForAI = [ { role: "system", content: systemPrompt }, ...history ];
-
-    const encoder = new TextEncoder();
-    const { readable, writable } = new TransformStream();
+    const { readable, writable } = new TransformStream<Uint8Array, Uint8Array>();
     const writer = writable.getWriter();
+    const emit = this.makeEmitter(writer);
 
-    const sendEvent = async (type: string, data: string) => {
-      await writer.write(encoder.encode(`data: ${JSON.stringify({ type, data })}\n\n`));
-    };
-
-    (async () => {
-      let finalResponse = "";
-      let isAgentFinished = false;
-      let loopCount = 0;
-      const maxLoops = 3; 
-      let toolsUsed: string[] = [];
-      let extractedSources: { id: number, title: string, url?: string }[] = [];
-      let sourceCounter = 1;
-
-      try {
-        while (!isAgentFinished && loopCount < maxLoops) {
-          loopCount++;
-          await sendEvent("status", "Agent is reasoning...");
-
-          const aiResponse = await this.env.AI.run('@cf/meta/llama-3.3-70b-instruct-fp8-fast', {
-            messages: messagesForAI,
-            max_tokens: 2048 
-          });
-
-          let output = aiResponse.response.trim();
-          const toolRegex = /<use_tool>[\s\S]*?<name>(.*?)<\/name>[\s\S]*?<query>(.*?)<\/query>[\s\S]*?<\/use_tool>/i;
-          const toolMatch = output.match(toolRegex);
-
-          if (toolMatch) {
-            const toolName = toolMatch[1].trim();
-            const toolQuery = toolMatch[2].trim();
-            toolsUsed.push(toolName);
-
-            await sendEvent("status", `🔬 Consulting ${toolName.replace('search_', '').toUpperCase()} for '${toolQuery}'...`);
-
-            let toolResult = "";
-            
-            if (toolName === "search_internal_sops") {
-              const queryVector = await this.env.AI.run('@cf/baai/bge-large-en-v1.5', { text: [toolQuery] });
-              const results = await this.env.VECTOR_INDEX.query(queryVector.data[0], { topK: 3, returnMetadata: 'all' });
-              
-              if (results.matches && results.matches.length > 0) {
-                // We use a traditional for-loop so we can await the D1 database lookups!
-                let compiledChunks = [];
-                for (const m of results.matches) {
-                  const sId = sourceCounter++;
-                  let filename = 'Internal Doc';
-                  
-                  // THE MISSING FILENAME FIX: Fetch the real name directly from D1 using the document_id
-                  if (m.metadata?.document_id) {
-                    const docRecord = await this.env.DB.prepare("SELECT filename FROM project_documents WHERE id = ?").bind(m.metadata.document_id).first();
-                    if (docRecord && docRecord.filename) filename = docRecord.filename as string;
-                  }
-                  
-                  extractedSources.push({ id: sId, title: filename });
-                  compiledChunks.push(`[Source ${sId}: ${filename}]\n${m.metadata?.text}`);
-                }
-                toolResult = compiledChunks.join("\n\n---\n\n");
-                await sendEvent("status", `Reading ${results.matches.length} document chunks...`);
-              } else {
-                toolResult = "No internal documents found.";
-              }
-            } 
-            
-            else if (toolName === "search_pubmed") {
-              const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(toolQuery)}&retmode=json&retmax=3&sort=relevance`;
-              const searchRes = await fetch(searchUrl).then(r => r.json());
-              const ids = searchRes.esearchresult?.idlist?.join(',');
-              
-              if (ids) {
-                const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id=${ids}&rettype=abstract&retmode=text`;
-                const textRes = await fetch(fetchUrl).then(r => r.text());
-                
-                const sId = sourceCounter++;
-                const firstUrl = `https://pubmed.ncbi.nlm.nih.gov/${ids.split(',')[0]}/`;
-                extractedSources.push({ id: sId, title: `PubMed Search: ${toolQuery}`, url: firstUrl });
-                
-                toolResult = `[Source ${sId}: PubMed Abstracts]\n\n${textRes}`;
-              } else {
-                toolResult = "No articles found on PubMed.";
-              }
-              await sendEvent("status", `Analyzing PubMed abstracts...`);
-            }
-
-            // SANITIZATION ARMOR
-            const safeToolResult = toolResult.replace(/"/g, "'");
-
-            messagesForAI.push({ role: "assistant", content: output }); 
-            messagesForAI.push({ 
-              role: "system", 
-              content: `TOOL RESULT:\n<context>\n${safeToolResult}\n</context>\n\nCRITICAL INSTRUCTION: Read the <context>. If it is completely unrelated to the user's question, IGNORE IT and answer from general knowledge WITHOUT [Source X] tags. If it is relevant, answer and cite using [Source X]. DO NOT USE XML.` 
-            });
-          } 
-          else {
-            finalResponse = output;
-            isAgentFinished = true;
-          }
-        }
-
-        if (!finalResponse) finalResponse = "I reached my computational limit trying to gather data.";
-
-        history.push({ role: "assistant", content: finalResponse });
-        await this.ctx.storage.put("chat_history", history);
-
-        await sendEvent("final", JSON.stringify({ response: finalResponse, toolsUsed, sources: extractedSources }));
-        await writer.close();
-
-      } catch (err: any) {
-        console.error("Agent Loop Crash:", err);
-        await sendEvent("final", JSON.stringify({ response: "I experienced a critical reasoning error.", toolsUsed: [], sources: [] }));
-        await writer.close();
-      }
-    })();
+    // Run the pipeline in the background so we can return the stream immediately
+    this.ctx.waitUntil(this.runPipeline(userMessage, history, emit, writer));
 
     return new Response(readable, {
       headers: {
         "Content-Type": "text/event-stream",
         "Cache-Control": "no-cache",
-        "Connection": "keep-alive"
-      }
+        "Connection": "keep-alive",
+      },
     });
+  }
+
+  // ─── Main Pipeline ──────────────────────────────────────────────────────────
+
+  private async runPipeline(
+    userMessage: string,
+    history: { role: string; content: string }[],
+    emit: (type: string, data: unknown) => Promise<void>,
+    writer: WritableStreamDefaultWriter<Uint8Array>
+  ) {
+    try {
+      // ── Step 1: Parallel Retrieval ──────────────────────────────────────────
+      await emit("thought", "🔍 Launching parallel retrieval across all knowledge sources...");
+
+      const [internalResult, pubmedResult] = await Promise.allSettled([
+        this.searchInternal(userMessage, emit),
+        this.searchPubMed(userMessage, emit),
+      ]);
+
+      // ── Step 2: Fuse Context ────────────────────────────────────────────────
+      const fusedContext = this.fuseContext(internalResult, pubmedResult);
+
+      await emit("thought", `✅ Context loaded: ${fusedContext.chunks.length} chunks from ${fusedContext.sources.length} source(s).`);
+
+      // Send source metadata immediately so the frontend can pre-build the bibliography
+      await emit("context_loaded", { sources: fusedContext.sources });
+
+      // ── Step 3: Build tagged context block ─────────────────────────────────
+      const contextBlock = fusedContext.chunks
+        .map(c => `[${c.chunkId}]\n${c.text}`)
+        .join("\n\n---\n\n");
+
+      // ── Step 4: Synthesize with strict citation rules ───────────────────────
+      await emit("thought", "🧠 Synthesizing response with sentence-level citations...");
+
+      const systemPrompt = this.buildSystemPrompt(contextBlock, fusedContext.chunks);
+
+      history.push({ role: "user", content: userMessage });
+
+      const aiResponse = await (this.env as any).AI.run(
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast",
+        {
+          messages: [
+            { role: "system", content: systemPrompt },
+            ...history,
+          ],
+          max_tokens: 2048,
+          stream: false,
+        }
+      );
+
+      const rawText: string = aiResponse.response?.trim() || "No response generated.";
+
+      // ── Step 5: Parse chunk IDs → numbered citations ────────────────────────
+      const { renderedText, citationMap } = this.parseCitations(rawText, fusedContext.chunks);
+
+      // ── Step 6: Stream the rendered text word-by-word ──────────────────────
+      const words = renderedText.split(" ");
+      for (const word of words) {
+        await emit("text_delta", word + " ");
+      }
+
+      // ── Step 7: Persist history & send final metadata ───────────────────────
+      history.push({ role: "assistant", content: renderedText });
+      await this.ctx.storage.put("chat_history", history.slice(-20)); // keep last 20 turns
+
+      const usedSources = fusedContext.sources.filter(s =>
+        citationMap.some(c => c.sourceId === s.id)
+      );
+
+      await emit("done", {
+        sources: usedSources,
+        citationMap,
+      });
+
+    } catch (err: any) {
+      console.error("Pipeline crash:", err);
+      await emit("error", { message: "A critical reasoning error occurred." });
+    } finally {
+      await writer.close();
+    }
+  }
+
+  // ─── Internal Vector Search ─────────────────────────────────────────────────
+
+  private async searchInternal(
+    query: string,
+    emit: (type: string, data: unknown) => Promise<void>
+  ): Promise<ChunkMeta[]> {
+    await emit("thought", "📚 Searching internal knowledge base...");
+
+    const embedding = await (this.env as any).AI.run("@cf/baai/bge-large-en-v1.5", {
+      text: [query],
+    });
+
+    const results = await (this.env as any).VECTOR_INDEX.query(
+      embedding.data[0],
+      { topK: 4, returnMetadata: "all" }
+    );
+
+    if (!results.matches || results.matches.length === 0) {
+      await emit("thought", "📚 Internal: no relevant chunks found.");
+      return [];
+    }
+
+    // Score threshold — only keep high-confidence matches
+    const relevant = results.matches.filter((m: any) => m.score > 0.65);
+
+    if (relevant.length === 0) {
+      await emit("thought", "📚 Internal: chunks found but below relevance threshold.");
+      return [];
+    }
+
+    await emit("thought", `📚 Internal: found ${relevant.length} relevant chunk(s).`);
+
+    const chunks: ChunkMeta[] = [];
+    let sourceId = 1;
+
+    for (const match of relevant) {
+      const docId = match.metadata?.document_id;
+      let title = "Internal Document";
+
+      if (docId) {
+        const row = await (this.env as any).DB
+          .prepare("SELECT filename FROM project_documents WHERE id = ?")
+          .bind(docId)
+          .first();
+        if (row?.filename) title = row.filename as string;
+      }
+
+      const chunkIdx = chunks.length;
+      chunks.push({
+        chunkId: `int_${chunkIdx}`,
+        sourceId,
+        title,
+        text: match.metadata?.text || "",
+      });
+      sourceId++;
+    }
+
+    return chunks;
+  }
+
+  // ─── PubMed Search ──────────────────────────────────────────────────────────
+
+  private async searchPubMed(
+    query: string,
+    emit: (type: string, data: unknown) => Promise<void>
+  ): Promise<ChunkMeta[]> {
+    await emit("thought", "🔬 Querying PubMed for external literature...");
+
+    try {
+      const searchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=${encodeURIComponent(query)}&retmode=json&retmax=3&sort=relevance`;
+      const searchRes = await fetch(searchUrl);
+      const searchData = await searchRes.json() as any;
+      const ids: string[] = searchData.esearchresult?.idlist || [];
+
+      if (ids.length === 0) {
+        await emit("thought", "🔬 PubMed: no articles found.");
+        return [];
+      }
+
+      await emit("thought", `🔬 PubMed: found ${ids.length} article(s). Fetching abstracts...`);
+
+      const fetchUrl = `https://eutils.ncbi.nlm.nih.gov/entrez/eutils/efetch.fcgi?db=pubmed&id=${ids.join(",")}&rettype=abstract&retmode=text`;
+      const text = await fetch(fetchUrl).then(r => r.text());
+
+      // Split into per-article chunks (rough split on double newline + PMID pattern)
+      const articleBlocks = text.split(/\n\n(?=\d+\.)/).slice(0, 3);
+
+      const chunks: ChunkMeta[] = articleBlocks.map((block, i) => ({
+        chunkId: `pub_${i}`,
+        sourceId: 100 + i, // offset so they don't collide with internal IDs
+        title: `PubMed: ${query} (${ids[i] || "abstract"})`,
+        url: `https://pubmed.ncbi.nlm.nih.gov/${ids[i]}/`,
+        text: block.trim(),
+      }));
+
+      await emit("thought", `🔬 PubMed: ${chunks.length} abstract chunk(s) loaded.`);
+      return chunks;
+
+    } catch (err) {
+      await emit("thought", "🔬 PubMed: request failed.");
+      return [];
+    }
+  }
+
+  // ─── Context Fusion ─────────────────────────────────────────────────────────
+
+  private fuseContext(
+    internalResult: PromiseSettledResult<ChunkMeta[]>,
+    pubmedResult: PromiseSettledResult<ChunkMeta[]>
+  ): FusionContext {
+    const internal = internalResult.status === "fulfilled" ? internalResult.value : [];
+    const pubmed = pubmedResult.status === "fulfilled" ? pubmedResult.value : [];
+
+    const allChunks = [...internal, ...pubmed];
+
+    // Re-number sourceIds sequentially after fusion
+    let counter = 1;
+    const idMap = new Map<number, number>();
+
+    for (const chunk of allChunks) {
+      if (!idMap.has(chunk.sourceId)) {
+        idMap.set(chunk.sourceId, counter++);
+      }
+      chunk.sourceId = idMap.get(chunk.sourceId)!;
+    }
+
+    const sources = allChunks
+      .filter((c, i, arr) => arr.findIndex(x => x.sourceId === c.sourceId) === i)
+      .map(c => ({ id: c.sourceId, title: c.title, url: c.url }));
+
+    return { chunks: allChunks, sources };
+  }
+
+  // ─── System Prompt ──────────────────────────────────────────────────────────
+
+  private buildSystemPrompt(contextBlock: string, chunks: ChunkMeta[]): string {
+    const chunkIndex = chunks
+      .map(c => `${c.chunkId} → Source [${c.sourceId}]: ${c.title}`)
+      .join("\n");
+
+    return `You are BioPro Copilot, an expert biomedical research assistant.
+
+You have been given a fused context block from two sources: internal lab documents and PubMed literature.
+
+CONTEXT BLOCK:
+${contextBlock || "(No relevant context found — answer from general knowledge.)"}
+
+CHUNK → SOURCE MAP:
+${chunkIndex || "(none)"}
+
+CITATION RULES (STRICT):
+1. After EVERY sentence that uses information from the context, append the chunk ID in square brackets, e.g.: "Actin regulates T-cell motility [int_0]."
+2. Use the EXACT chunk ID from the CHUNK → SOURCE MAP above.
+3. If a sentence uses multiple chunks, list all: "... [int_0][pub_1]."
+4. If a sentence comes from your general knowledge (not the context), do NOT append any tag.
+5. NEVER invent chunk IDs. Only use IDs listed above.
+6. NEVER generate URLs yourself.
+7. Write in clear, confident scientific prose. Use markdown headers and bullet points where helpful.`;
+  }
+
+  // ─── Citation Parser ─────────────────────────────────────────────────────────
+
+  private parseCitations(
+    rawText: string,
+    chunks: ChunkMeta[]
+  ): { renderedText: string; citationMap: { chunkId: string; sourceId: number }[] } {
+    const chunkToSource = new Map(chunks.map(c => [c.chunkId, c.sourceId]));
+    const citationMap: { chunkId: string; sourceId: number }[] = [];
+
+    // Track which sourceIds have been assigned a display number
+    const sourceDisplayNum = new Map<number, number>();
+    let displayCounter = 1;
+
+    // Replace [chunk_id] with [N] superscript notation
+    const renderedText = rawText.replace(/\[(\w+_\d+)\]/g, (_, chunkId) => {
+      const sourceId = chunkToSource.get(chunkId);
+      if (sourceId === undefined) return ""; // unknown chunk id — strip it
+
+      if (!sourceDisplayNum.has(sourceId)) {
+        sourceDisplayNum.set(sourceId, displayCounter++);
+        citationMap.push({ chunkId, sourceId });
+      }
+
+      const num = sourceDisplayNum.get(sourceId)!;
+      return `[${num}]`;
+    });
+
+    return { renderedText, citationMap };
   }
 }
