@@ -30,9 +30,9 @@ interface Log {
   created_at: string;
 }
 
-// ─── Markdown renderer ────────────────────────────────────────────────────────
+// ─── Markdown renderer (Upgraded for Inline Citations) ────────────────────────
 
-const mdComponents = {
+const getMdComponents = (sources: Source[], onCiteClick: (src: Source) => void) => ({
   h3: ({ ...props }) => (
     <h3 style={{ marginTop: 16, marginBottom: 8, fontSize: '1.1rem', fontWeight: 600, color: THEME.FG_PRIMARY }} {...props} />
   ),
@@ -44,7 +44,16 @@ const mdComponents = {
   code: ({ ...props }) => (
     <code style={{ backgroundColor: THEME.BG_LIGHT, padding: '2px 6px', borderRadius: 4, fontSize: '0.88rem', fontFamily: 'monospace' }} {...props} />
   ),
-};
+  // THE MAGIC INLINE INTERCEPTOR
+  a: ({ href, children, ...props }: any) => {
+    if (href?.startsWith('#cite-')) {
+      const num = parseInt(href.replace('#cite-', ''));
+      const src = sources.find(s => s.id === num);
+      if (src) return <CitationBubble num={num} onClick={() => onCiteClick(src)} />;
+    }
+    return <a href={href} target="_blank" rel="noreferrer" style={{ color: THEME.DNA_PRIMARY, textDecoration: 'underline' }} {...props}>{children}</a>;
+  }
+});
 
 // ─── Sub-components ───────────────────────────────────────────────────────────
 
@@ -105,34 +114,12 @@ function CitationBubble({ num, onClick }: { num: number; onClick: () => void }) 
         marginLeft: 2, verticalAlign: 'super',
         transition: 'background 0.2s',
         userSelect: 'none',
+        whiteSpace: 'nowrap'
       }}
       title={`View source ${num}`}
     >
       {num}
     </sup>
-  );
-}
-
-// Render text with clickable [N] citations
-function CitedContent({ text, sources, onCiteClick }: {
-  text: string;
-  sources: Source[];
-  onCiteClick: (src: Source) => void;
-}) {
-  const parts = text.split(/(\[\d+\])/g);
-  return (
-    <>
-      {parts.map((part, i) => {
-        const match = part.match(/^\[(\d+)\]$/);
-        if (match) {
-          const num = parseInt(match[1]);
-          const src = sources.find(s => s.id === num);
-          if (src) return <CitationBubble key={i} num={num} onClick={() => onCiteClick(src)} />;
-        }
-        // Render remaining text through ReactMarkdown
-        return <span key={i}><ReactMarkdown components={mdComponents as any}>{part}</ReactMarkdown></span>;
-      })}
-    </>
   );
 }
 
@@ -143,6 +130,7 @@ export default function ActiveExperiment() {
   const navigate = useNavigate();
 
   const [messages, setMessages] = useState<Message[]>([]);
+  const [projectStatus, setProjectStatus] = useState('In Progress');
   const [streamingThoughts, setStreamingThoughts] = useState<string[]>([]);
   const [streamingText, setStreamingText] = useState('');
   const [streamingSources, setStreamingSources] = useState<Source[]>([]);
@@ -160,12 +148,30 @@ export default function ActiveExperiment() {
   }, [messages, streamingText, streamingThoughts]);
 
   // Load logs
+  // Load logs & status
   useEffect(() => {
+    // 1. Fetch Logs
     fetch(`${BACKEND_URL}/api/logs?experimentId=${experimentId}`, { credentials: 'include' })
       .then(r => r.json())
       .then(d => { if (d.logs) setLogs(d.logs); })
       .catch(console.error);
+
+    // 2. Fetch Status
+    fetch(`${BACKEND_URL}/api/status?experimentId=${experimentId}`, { credentials: 'include' })
+      .then(r => r.json())
+      .then(d => { if (d.status) setProjectStatus(d.status); })
+      .catch(console.error);
   }, [experimentId]);
+
+  const handleStatusChange = async (newStatus: string) => {
+    setProjectStatus(newStatus); // Optimistic UI update
+    fetch(`${BACKEND_URL}/api/status`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ experimentId, status: newStatus }),
+    }).catch(console.error);
+  };
 
   // ── SSE Pipeline ─────────────────────────────────────────────────────────────
 
@@ -224,7 +230,6 @@ export default function ActiveExperiment() {
               else if (event.type === 'done') {
                 const usedSources: Source[] = event.data.sources || finalSources;
 
-                // Attach chunk text to sources for the drawer
                 const enrichedSources = usedSources.map((s: Source) => ({
                   ...s,
                   text: s.text || '(Source text not returned in this version)',
@@ -307,7 +312,29 @@ export default function ActiveExperiment() {
       <div style={{ padding: '10px 28px', backgroundColor: THEME.BG_MEDIUM, borderBottom: `1px solid ${THEME.BORDER}`, display: 'flex', alignItems: 'center', gap: 16, flexShrink: 0 }}>
         <button onClick={() => navigate(-1)} style={{ background: 'none', border: 'none', color: THEME.ACCENT_PRIMARY, cursor: 'pointer', fontSize: '0.9rem' }}>← Back</button>
         <span style={{ color: THEME.BORDER }}>|</span>
-        <span style={{ color: THEME.FG_PRIMARY, fontSize: '0.95rem', fontWeight: 500 }}>Run: {experimentId}</span>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span style={{ color: THEME.FG_PRIMARY, fontSize: '0.95rem', fontWeight: 500 }}>Run: {experimentId}</span>
+          <select
+            value={projectStatus}
+            onChange={(e) => handleStatusChange(e.target.value)}
+            style={{
+              backgroundColor: THEME.BG_DARKEST,
+              color: THEME.FG_SECONDARY,
+              border: `1px solid ${THEME.BORDER}`,
+              borderRadius: 6,
+              padding: '4px 8px',
+              fontSize: '0.82rem',
+              outline: 'none',
+              cursor: 'pointer',
+              fontWeight: 600
+            }}
+          >
+            <option value="In Progress">🟢 In Progress</option>
+            <option value="Completed">✅ Completed</option>
+            <option value="Stalled">⏸️ Stalled</option>
+            <option value="Given Up">❌ Given Up</option>
+          </select>
+        </div>
 
         <div style={{ marginLeft: 'auto', display: 'flex', gap: 8 }}>
           {(['general', 'notebook'] as const).map(m => (
@@ -352,11 +379,10 @@ export default function ActiveExperiment() {
                   color: THEME.FG_PRIMARY, fontSize: '0.93rem', lineHeight: 1.65,
                 }}>
                   {msg.role === 'user' ? msg.content : (
-                    <CitedContent
-                      text={msg.content}
-                      sources={msg.sources || []}
-                      onCiteClick={setActiveSource}
-                    />
+                    <ReactMarkdown components={getMdComponents(msg.sources || [], setActiveSource) as any}>
+                      {/* Convert [1] into standard Markdown links before parsing */}
+                      {msg.content.replace(/\[(\d+)\]/g, '[$1](#cite-$1)')}
+                    </ReactMarkdown>
                   )}
                 </div>
 
@@ -389,7 +415,9 @@ export default function ActiveExperiment() {
                 {streamingThoughts.length > 0 && <ThoughtTrail thoughts={streamingThoughts} />}
                 {streamingText && (
                   <div style={{ maxWidth: '94%', padding: '14px 18px', borderRadius: 10, backgroundColor: THEME.BG_MEDIUM, color: THEME.FG_PRIMARY, fontSize: '0.93rem', lineHeight: 1.65 }}>
-                    <ReactMarkdown components={mdComponents as any}>{streamingText}</ReactMarkdown>
+                    <ReactMarkdown components={getMdComponents(streamingSources, setActiveSource) as any}>
+                      {streamingText.replace(/\[(\d+)\]/g, '[$1](#cite-$1)')}
+                    </ReactMarkdown>
                     <span style={{ display: 'inline-block', width: 8, height: 14, backgroundColor: THEME.ACCENT_PRIMARY, marginLeft: 2, animation: 'blink 1s step-end infinite', borderRadius: 1 }} />
                     <style>{`@keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }`}</style>
                   </div>
@@ -465,7 +493,7 @@ export default function ActiveExperiment() {
                     <span>{new Date(log.created_at).toLocaleTimeString()}</span>
                   </div>
                   <div style={{ fontSize: '0.9rem', color: THEME.FG_PRIMARY, lineHeight: 1.65 }}>
-                    <ReactMarkdown components={mdComponents as any}>{log.content}</ReactMarkdown>
+                    <ReactMarkdown components={getMdComponents([], () => {}) as any}>{log.content}</ReactMarkdown>
                   </div>
                 </div>
               ))}
